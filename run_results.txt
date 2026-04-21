@@ -1,0 +1,278 @@
+Code:
+# =============================================================================
+# Investigate cont_acct tokenization issue — using transformation_new functions
+# =============================================================================
+from pyspark.sql import functions as F
+import transformations as tx
+
+# -----------------------------------------------------------------------------
+# Step 1: Build df_stg using the actual module function
+# -----------------------------------------------------------------------------
+# (if you've already built df_stg in a previous cell, skip these lines)
+df_dtsk      = tx.prepare_dtsk(party, party_rltd, spark)
+df_cpz       = tx.prepare_cpz(cont, cont_rltd, spark)
+df_ukaz1     = tx.prepare_ukaz1(cont, cont_val, cont_dt_hist, spark)
+df_cont_stav = tx.prepare_cont_stav(cont_stat_type_gen, spark)
+
+df_stg = tx.prepare_stg_insurance_cont(
+    party, df_dtsk, party_cont, cont, df_cpz,
+    cont_gen, cont_prod, prod, cont_stat, df_cont_stav,
+    cont_dt_actl, df_ukaz1, spark
+).cache()
+df_stg.count()
+
+# -----------------------------------------------------------------------------
+# Step 2: What do cont_acct values look like AFTER tx.prepare_stg_insurance_cont?
+# -----------------------------------------------------------------------------
+print("=== df_stg.cont_acct (post-tokenization by tx.prepare_stg_insurance_cont) ===")
+df_stg.select("cont_acct").filter(F.col("cont_acct").isNotNull()) \
+      .distinct().limit(20).show(truncate=False)
+
+total_stg  = df_stg.filter(F.col("cont_acct").isNotNull()).count()
+stg_dashed = df_stg.filter(F.col("cont_acct").contains("-")).count()
+print(f"df_stg total rows: {total_stg}   with dashes: {stg_dashed}   "
+      f"stripped: {total_stg - stg_dashed}")
+
+# -----------------------------------------------------------------------------
+# Step 3: What do the storna join-key columns look like (raw from clean layer)?
+# -----------------------------------------------------------------------------
+print("\n=== pzp_storna.kod_cislo_zmluvy samples ===")
+pzp_storna.select("kod_cislo_zmluvy").filter(F.col("kod_cislo_zmluvy").isNotNull()) \
+          .distinct().limit(20).show(truncate=False)
+
+print("=== cakaren.kod_cislo_zmluvy samples ===")
+cakaren.select("kod_cislo_zmluvy").filter(F.col("kod_cislo_zmluvy").isNotNull()) \
+       .distinct().limit(20).show(truncate=False)
+
+print("=== ins_zmluvy.c_poj_sml samples ===")
+ins_zmluvy.select("c_poj_sml").filter(F.col("c_poj_sml").isNotNull()) \
+          .distinct().limit(20).show(truncate=False)
+
+# Dash counts
+for name, df, col in [
+    ("pzp_storna",  pzp_storna,  "kod_cislo_zmluvy"),
+    ("cakaren",     cakaren,     "kod_cislo_zmluvy"),
+    ("ins_zmluvy",  ins_zmluvy,  "c_poj_sml"),
+]:
+    total  = df.filter(F.col(col).isNotNull()).count()
+    dashed = df.filter(F.col(col).contains("-")).count()
+    print(f"{name:12s} total={total:>8}   with_dash={dashed:>8}   "
+          f"stripped={total - dashed:>8}")
+
+# -----------------------------------------------------------------------------
+# Step 4: How many storna rows actually match df_stg via tx.prepare_contract?
+# -----------------------------------------------------------------------------
+# The real prepare_contract implicitly does the joins we want to measure.
+# Build it and count matches via df_contract.dt_canceled_ins provenance.
+print("\n=== Running tx.prepare_contract and measuring match rates ===")
+
+df_c        = tx.prepare_c(df_stg, spark)
+df_contract = tx.prepare_contract(df_c, cakaren, pzp_storna, ins_zmluvy, spark).cache()
+df_contract.count()
+
+# Count how many rows in df_contract now have a dt_canceled_ins that came
+# from the storna coalesce (i.e. were NULL in df_stg but got populated)
+stg_null   = df_stg.filter(F.col("dt_canceled_ins").isNull()).count()
+stg_filled = df_stg.count() - stg_null
+
+ct_null    = df_contract.filter(F.col("dt_canceled_ins").isNull()).count()
+ct_filled  = df_contract.count() - ct_null
+
+print(f"\ndf_stg:      dt_canceled_ins filled={stg_filled}, NULL={stg_null}")
+print(f"df_contract: dt_canceled_ins filled={ct_filled}, NULL={ct_null}")
+print(f"Rows rescued by storna joins: {ct_filled - stg_filled}")
+
+# -----------------------------------------------------------------------------
+# Step 5: What if df_stg.cont_acct had NOT been tokenized? The cleanest way to
+# test this is to re-run tx.prepare_contract, passing storna tables with keys
+# tokenized the same way as cont_acct. This simulates "what if tokenization
+# happened in prepare_c instead, matching SQL".
+# -----------------------------------------------------------------------------
+print("\n=== Alt scenario: tokenize storna keys before prepare_contract ===")
+
+def _tokenize(df, col):
+    """Apply the same tokenization rules as tx.prepare_stg_insurance_cont."""
+    return df.withColumn(
+        col,
+        F.when(F.instr(col, "-") == 0, F.col(col))
+         .when(F.instr(col, "-") == 4, F.regexp_replace(col, "-", ""))
+         .when(F.instr(col, "-").isin(10, 11), F.substring_index(col, "-", 1))
+         .otherwise(F.col(col))
+    )
+
+pzp_tok     = _tokenize(pzp_storna, "kod_cislo_zmluvy")
+cak_tok     = _tokenize(cakaren,    "kod_cislo_zmluvy")
+ins_tok     = _tokenize(ins_zmluvy, "c_poj_sml")
+
+df_contract_alt = tx.prepare_contract(df_c, cak_tok, pzp_tok, ins_tok, spark).cache()
+df_contract_alt.count()
+
+ct_alt_null    = df_contract_alt.filter(F.col("dt_canceled_ins").isNull()).count()
+ct_alt_filled  = df_contract_alt.count() - ct_alt_null
+
+print(f"df_contract (current):    dt_canceled_ins filled={ct_filled}")
+print(f"df_contract (tokenized):  dt_canceled_ins filled={ct_alt_filled}")
+print(f"DELTA rescued by tokenizing storna keys: {ct_alt_filled - ct_filled}")
+
+# -----------------------------------------------------------------------------
+# Step 6: Bottom-line impact on the aggregates
+# -----------------------------------------------------------------------------
+print("\n=== Impact on per-row i_canceled under alt scenario ===")
+
+# In prepare_tmp_insurance_cont2, i_canceled depends on dt_canceled_ins being
+# within (process_dt - 1 month, process_dt]. Let's count rescued cancellations
+# that also fall in the window.
+spark.conf.get("process_dt")   # sanity: confirm the variable is set
+
+new_in_window = df_contract_alt.filter(
+    F.col("dt_canceled_ins").isNotNull()
+    & ~F.col("cont_acct").isin([r["cont_acct"] for r in
+                                 df_contract.filter(F.col("dt_canceled_ins").isNotNull())
+                                            .select("cont_acct").collect()])
+).count()
+
+print(f"Contracts newly cancelled under alt scenario: {new_in_window}")
+print("  (these are candidates for the missing c_canceled_total_ins / i_canceled_ins)")
+
+Output:
+INFO:root:Unprotecting ('CONT_ACCT',)                                           
+INFO:root:Protectors will unprotect column 'CONT_ACCT' with policy 'de_DSK_AccountNumber' and salt 'None'
+INFO:root:Spark operations for  unprotection submitted. Since Spark is lazy, it will evaluate these transformations when the next Spark action (e.g. count, write) is triggered.
+INFO:root:Protecting ('cont_acct',)
+INFO:root:Protectors will protect column 'cont_acct' with policy 'de_DSK_AccountNumber' and salt 'None'
+INFO:root:Spark operations for  protection submitted. Since Spark is lazy, it will evaluate these transformations when the next Spark action (e.g. count, write) is triggered.
+26/04/21 07:47:11 WARN CacheManager: Asked to cache already cached data.        
+                                                                                
+=== df_stg.cont_acct (post-tokenization by tx.prepare_stg_insurance_cont) ===
+                                                                                
++-----------+
+|cont_acct  |
++-----------+
+|4894004393 |
+|6050753283 |
+|5491682706 |
+|03770337229|
+|75672172996|
+|28069034799|
+|52816522200|
+|26809584333|
+|95596550570|
+|6549323396 |
+|6529903870 |
+|41087865735|
+|5391006040 |
+|58898083079|
+|0260004411 |
+|09695135920|
+|23660554630|
+|66872403214|
+|99704717746|
+|5801691749 |
++-----------+
+
+                                                                                
+df_stg total rows: 1227000   with dashes: 3838   stripped: 1223162
+
+=== pzp_storna.kod_cislo_zmluvy samples ===
++----------------+
+|kod_cislo_zmluvy|
++----------------+
+|47421975024     |
+|60702890562     |
+|54655209479     |
+|54358726196     |
+|00746407420     |
+|88967255357     |
+|09651404302     |
+|86007816691     |
+|35073003506     |
+|17062134658     |
+|66227877131     |
+|55479223360     |
+|70162768023     |
+|37452851136     |
+|62097807898     |
+|19325821744     |
+|63576782112     |
+|43492495490     |
+|69961636223     |
+|70216388838     |
++----------------+
+
+=== cakaren.kod_cislo_zmluvy samples ===
++----------------+
+|kod_cislo_zmluvy|
++----------------+
+|83536389426     |
+|17705461962     |
+|59269764782     |
+|23635863262     |
+|11959316303     |
+|00457307065     |
+|33276325408     |
+|40639333918     |
+|4176537974      |
+|75817667768     |
+|3629123321      |
+|59820506073     |
+|6772638968      |
+|22772118741     |
+|82214542730     |
+|36326205494     |
+|62113467979     |
+|1053039048      |
+|90979321386     |
+|47943806937     |
++----------------+
+
+=== ins_zmluvy.c_poj_sml samples ===
+                                                                                
++----------+
+|c_poj_sml |
++----------+
+|8900385805|
+|4400020903|
+|9173346030|
+|0734559089|
+|8783108913|
+|5177407260|
+|8198233340|
+|5459339727|
+|1992151983|
+|0876753571|
+|0907454077|
+|0818633608|
+|1764218156|
+|9323970167|
+|4509127612|
+|0464053035|
+|0527241213|
+|2795636531|
+|5209321694|
+|5382537651|
++----------+
+
+pzp_storna   total=    7074   with_dash=       0   stripped=    7074
+cakaren      total=    3287   with_dash=       0   stripped=    3287
+                                                                                
+ins_zmluvy   total= 4014188   with_dash=       0   stripped= 4014188
+
+=== Running tx.prepare_contract and measuring match rates ===
+                                                                                
+
+df_stg:      dt_canceled_ins filled=315953, NULL=911047
+df_contract: dt_canceled_ins filled=556960, NULL=681654
+Rows rescued by storna joins: 241007
+
+=== Alt scenario: tokenize storna keys before prepare_contract ===
+                                                                                
+df_contract (current):    dt_canceled_ins filled=556960
+df_contract (tokenized):  dt_canceled_ins filled=556960
+DELTA rescued by tokenizing storna keys: 0
+
+=== Impact on per-row i_canceled under alt scenario ===
+26/04/21 07:53:11 WARN DAGScheduler: Broadcasting large task binary with size 12.8 MiB
+[Stage 1099:===================================================>(199 + 1) / 200]
+Contracts newly cancelled under alt scenario: 0
+  (these are candidates for the missing c_canceled_total_ins / i_canceled_ins)
+                                                                                
