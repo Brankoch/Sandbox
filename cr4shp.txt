@@ -1,1 +1,15 @@
 https://adastrabiz.sharepoint.com/:u:/r/sites/adastrask/ACC_KBC/Project Activities/AWS (KBC EDISON AWS analysis)/CSOB SK/10_ATTR_CR4_Extension/02_Analysis %26 Design/EDISON_CSON_ATTR_CR4_AI_output.zip?csf=1&web=1&e=EzOGWf
+
+customer contract
+#ccdb__dh__s_ccd_party_contact" ## odkial je DH vrstva ??? neviem tabulky nikde najst
+
+attr AFP
+#("master", "ccdb__od__e_event_log"),  ##sem existuju rozne verzie event_<adj>/<adl>/<af4>/<afi>/<ah6>... 
+#("master", "ccdb__od__f_real_estate_fact_log"), neexistuje
+#("master", "ccdb__od__f_vehicle_fact_log"),    neexistuje
+
+
+attr INTERACTION
+#("master", "ccdb__od__e_event_log"),  ##sem existuju rozne verzie event_<adj>/<adl>/<af4>/<afi>/<ah6>... 
+#("master", "ccdb__od__f_event_detail_log"),  ##sem existuju rozne verzie event_detail_<csd>/<csv_exec_history>/<cyd>/<dqw>/<ah6>..
+#"ccdb__dh__s_ccd_party" ## odkial je DH vrstva ??? neviem tabulky nikde najst
